@@ -868,16 +868,27 @@ fn assessment_for_key(
         }
         LoginProviderAuthStateKey::Gemini => {
             let (source, detail) = summarize_sources(vec![gemini_source()]);
+            let has_api_key = crate::auth::gemini::has_gemini_api_key();
             (
                 source,
                 detail,
                 if state == AuthState::NotConfigured {
                     AuthExpiryConfidence::Unknown
+                } else if has_api_key {
+                    AuthExpiryConfidence::NotApplicable
                 } else {
                     AuthExpiryConfidence::Exact
                 },
-                AuthRefreshSupport::Automatic,
-                AuthValidationMethod::TimestampCheck,
+                if has_api_key {
+                    AuthRefreshSupport::NotApplicable
+                } else {
+                    AuthRefreshSupport::Automatic
+                },
+                if has_api_key {
+                    AuthValidationMethod::PresenceCheck
+                } else {
+                    AuthValidationMethod::TimestampCheck
+                },
             )
         }
         LoginProviderAuthStateKey::Cursor => {
@@ -1068,6 +1079,12 @@ fn openai_api_key_source(status: &AuthStatus) -> Option<(AuthCredentialSource, S
 }
 
 fn gemini_source() -> Option<(AuthCredentialSource, String)> {
+    if crate::auth::gemini::has_gemini_api_key() {
+        return Some((
+            AuthCredentialSource::EnvironmentVariable,
+            format!("{} environment variable", crate::auth::gemini::GEMINI_API_KEY_ENV),
+        ));
+    }
     if let Ok(path) = crate::auth::gemini::tokens_path()
         && path.exists()
     {

@@ -2,6 +2,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{self, IsTerminal, Write};
 
+pub const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
+
+/// Look up the Gemini API key from the environment.
+pub fn load_gemini_api_key() -> Option<String> {
+    std::env::var(GEMINI_API_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Returns true when a Gemini API key is set in the environment.
+pub fn has_gemini_api_key() -> bool {
+    load_gemini_api_key().is_some()
+}
+
 const GOOGLE_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -113,7 +128,7 @@ pub fn has_gemini_cli() -> bool {
 
 /// Check if native Gemini OAuth tokens are available (including imported Gemini CLI tokens).
 pub fn has_cached_auth() -> bool {
-    load_tokens().is_ok()
+    has_gemini_api_key() || load_tokens().is_ok()
 }
 
 pub fn tokens_path() -> Result<std::path::PathBuf> {
@@ -153,6 +168,16 @@ pub fn trust_cli_auth_for_future_use() -> Result<()> {
 }
 
 pub fn load_tokens() -> Result<GeminiTokens> {
+    // API key takes precedence over OAuth when set.
+    if let Some(api_key) = load_gemini_api_key() {
+        return Ok(GeminiTokens {
+            access_token: api_key,
+            refresh_token: String::new(),
+            expires_at: i64::MAX,
+            email: None,
+        });
+    }
+
     let native_path = tokens_path()?;
     if native_path.exists() {
         crate::storage::harden_secret_file_permissions(&native_path);
