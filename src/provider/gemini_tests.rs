@@ -3,6 +3,9 @@ use crate::message::{ContentBlock, Message, Role};
 use crate::provider::{EventStream, Provider};
 use crate::tool::Registry;
 use async_trait::async_trait;
+use futures::StreamExt;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::Arc;
 
 struct MockProvider;
@@ -151,6 +154,163 @@ fn available_models_display_seeds_from_persisted_catalog() {
         crate::env::set_var("JCODE_HOME", prev_home);
     } else {
         crate::env::remove_var("JCODE_HOME");
+    }
+}
+
+#[tokio::test]
+async fn prefetch_models_with_api_key_uses_public_model_list_without_oauth() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_key = std::env::var_os(crate::auth::gemini::GEMINI_API_KEY_ENV);
+    let prev_endpoint = std::env::var_os("GEMINI_API_ENDPOINT");
+    let prev_version = std::env::var_os("GEMINI_API_VERSION");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept model list request");
+        let mut request = [0; 2048];
+        let n = stream.read(&mut request).expect("read request");
+        let request = String::from_utf8_lossy(&request[..n]);
+        assert!(request.starts_with("GET /v1beta/models?key=gemini-test-key HTTP/1.1"));
+        let body = serde_json::json!({
+            "models": [
+                {"name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"]},
+                {"name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"]}
+            ]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+    });
+
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::set_var(crate::auth::gemini::GEMINI_API_KEY_ENV, "gemini-test-key");
+    crate::env::set_var("GEMINI_API_ENDPOINT", format!("http://{addr}"));
+    crate::env::set_var("GEMINI_API_VERSION", "v1beta");
+
+    let provider = GeminiProvider::new();
+    provider.prefetch_models().await.expect("prefetch models");
+    assert!(
+        provider
+            .available_models_display()
+            .contains(&"gemini-2.5-flash".to_string())
+    );
+    handle.join().expect("server thread");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    if let Some(prev_key) = prev_key {
+        crate::env::set_var(crate::auth::gemini::GEMINI_API_KEY_ENV, prev_key);
+    } else {
+        crate::env::remove_var(crate::auth::gemini::GEMINI_API_KEY_ENV);
+    }
+    if let Some(prev_endpoint) = prev_endpoint {
+        crate::env::set_var("GEMINI_API_ENDPOINT", prev_endpoint);
+    } else {
+        crate::env::remove_var("GEMINI_API_ENDPOINT");
+    }
+    if let Some(prev_version) = prev_version {
+        crate::env::set_var("GEMINI_API_VERSION", prev_version);
+    } else {
+        crate::env::remove_var("GEMINI_API_VERSION");
+    }
+}
+
+#[tokio::test]
+async fn complete_with_api_key_uses_public_generate_content_without_oauth_setup() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_key = std::env::var_os(crate::auth::gemini::GEMINI_API_KEY_ENV);
+    let prev_endpoint = std::env::var_os("GEMINI_API_ENDPOINT");
+    let prev_version = std::env::var_os("GEMINI_API_VERSION");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("server addr");
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept generate request");
+        let mut request = [0; 4096];
+        let n = stream.read(&mut request).expect("read request");
+        let request = String::from_utf8_lossy(&request[..n]);
+        assert!(request.starts_with(
+            "POST /v1beta/models/gemini-2.5-flash:generateContent?key=gemini-test-key HTTP/1.1"
+        ));
+        assert!(request.contains("hello gemini"));
+        let body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "hello from api key"}]},
+                "finishReason": "STOP"
+            }]
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+    });
+
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::set_var(crate::auth::gemini::GEMINI_API_KEY_ENV, "gemini-test-key");
+    crate::env::set_var("GEMINI_API_ENDPOINT", format!("http://{addr}"));
+    crate::env::set_var("GEMINI_API_VERSION", "v1beta");
+
+    let provider = GeminiProvider::new();
+    provider.set_model("gemini-2.5-flash").expect("set model");
+    let messages = vec![Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello gemini".to_string(),
+            cache_control: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+    let mut stream = provider
+        .complete(&messages, &[], "", None)
+        .await
+        .expect("complete stream");
+    let mut saw_text = false;
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta(text) = event.expect("stream event") {
+            assert_eq!(text, "hello from api key");
+            saw_text = true;
+        }
+    }
+    assert!(saw_text);
+    handle.join().expect("server thread");
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    if let Some(prev_key) = prev_key {
+        crate::env::set_var(crate::auth::gemini::GEMINI_API_KEY_ENV, prev_key);
+    } else {
+        crate::env::remove_var(crate::auth::gemini::GEMINI_API_KEY_ENV);
+    }
+    if let Some(prev_endpoint) = prev_endpoint {
+        crate::env::set_var("GEMINI_API_ENDPOINT", prev_endpoint);
+    } else {
+        crate::env::remove_var("GEMINI_API_ENDPOINT");
+    }
+    if let Some(prev_version) = prev_version {
+        crate::env::set_var("GEMINI_API_VERSION", prev_version);
+    } else {
+        crate::env::remove_var("GEMINI_API_VERSION");
     }
 }
 

@@ -32,6 +32,19 @@ struct PersistedCatalog {
     fetched_at_rfc3339: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct GeminiApiModelListResponse {
+    #[serde(default)]
+    models: Vec<GeminiApiModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeminiApiModel {
+    name: String,
+    #[serde(default, rename = "supportedGenerationMethods")]
+    supported_generation_methods: Vec<String>,
+}
+
 pub struct GeminiProvider {
     client: reqwest::Client,
     model: Arc<RwLock<String>>,
@@ -199,6 +212,10 @@ impl GeminiProvider {
     }
 
     async fn refresh_available_models(&self) -> Result<Vec<String>> {
+        if let Some(api_key) = gemini_auth::load_api_key() {
+            return self.refresh_available_models_with_api_key(&api_key).await;
+        }
+
         let project_id_env = google_cloud_project_from_env();
         let load_req = load_code_assist_request(
             project_id_env.clone(),
@@ -216,6 +233,61 @@ impl GeminiProvider {
         if !models.is_empty() {
             crate::logging::info(&format!(
                 "Discovered Gemini Code Assist models: {}",
+                models.join(", ")
+            ));
+            if let Ok(mut guard) = self.fetched_models.write() {
+                *guard = models.clone();
+            }
+            Self::persist_catalog(&models);
+        }
+        Ok(models)
+    }
+
+    async fn refresh_available_models_with_api_key(&self, api_key: &str) -> Result<Vec<String>> {
+        let endpoint = std::env::var("GEMINI_API_ENDPOINT")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let version = std::env::var("GEMINI_API_VERSION").unwrap_or_else(|_| "v1beta".to_string());
+        let url = format!("{endpoint}/{version}/models");
+        let response = self
+            .client
+            .get(&url)
+            .query(&[("key", api_key)])
+            .send()
+            .await
+            .with_context(|| format!("Gemini API model discovery request to {} failed", url))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = crate::util::http_error_body(response, "HTTP error").await;
+            anyhow::bail!(
+                "Gemini API model discovery failed (HTTP {}): {}",
+                status,
+                body.trim()
+            );
+        }
+
+        let response: GeminiApiModelListResponse = response
+            .json()
+            .await
+            .context("Failed to parse Gemini API model discovery response")?;
+        let models = merge_gemini_model_lists(
+            response
+                .models
+                .into_iter()
+                .filter(|model| {
+                    model.supported_generation_methods.is_empty()
+                        || model
+                            .supported_generation_methods
+                            .iter()
+                            .any(|method| method == "generateContent")
+                })
+                .map(|model| model.name.trim_start_matches("models/").to_string())
+                .filter(|model| is_gemini_model_id(model))
+                .collect(),
+        );
+        if !models.is_empty() {
+            crate::logging::info(&format!(
+                "Discovered Gemini API models: {}",
                 models.join(", ")
             ));
             if let Ok(mut guard) = self.fetched_models.write() {
@@ -343,6 +415,113 @@ impl GeminiProvider {
             .context("Failed to parse Gemini operation response")
     }
 
+    async fn post_api_key_json<T: DeserializeOwned>(
+        &self,
+        model: &str,
+        method: &str,
+        api_key: &str,
+        body: &impl Serialize,
+    ) -> Result<T> {
+        let endpoint = std::env::var("GEMINI_API_ENDPOINT")
+            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+        let version = std::env::var("GEMINI_API_VERSION").unwrap_or_else(|_| "v1beta".to_string());
+        let url = format!(
+            "{endpoint}/{version}/models/{}:{method}",
+            model.trim_start_matches("models/")
+        );
+        let body_value =
+            serde_json::to_value(body).context("Failed to serialize Gemini API request body")?;
+        let mut last_error: Option<anyhow::Error> = None;
+        let mut resp = None;
+        for attempt in 0..2 {
+            let client = if attempt == 0 {
+                self.client.clone()
+            } else {
+                gemini_http_client()
+            };
+            match client
+                .post(&url)
+                .query(&[("key", api_key)])
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&body_value)
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    resp = Some(response);
+                    break;
+                }
+                Err(err) if attempt == 0 && is_transient_gemini_transport_error(&err) => {
+                    last_error = Some(err.into());
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("Gemini API request to {} failed", url));
+                }
+            }
+        }
+        let resp = match resp {
+            Some(resp) => resp,
+            None => {
+                let err =
+                    last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini API request failed"));
+                return Err(err).with_context(|| format!("Gemini API request to {} failed", url));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = crate::util::http_error_body(resp, "HTTP error").await;
+            anyhow::bail!(
+                "Gemini API request {} failed (HTTP {}): {}",
+                method,
+                status,
+                body.trim()
+            );
+        }
+
+        resp.json()
+            .await
+            .with_context(|| format!("Failed to parse Gemini API {} response", method))
+    }
+
+    async fn generate_content_with_api_key(
+        &self,
+        api_key: &str,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolDefinition],
+        system: &str,
+    ) -> Result<CodeAssistGenerateResponse> {
+        let request = VertexGenerateContentRequest {
+            contents: build_contents(messages),
+            system_instruction: build_system_instruction(system),
+            tools: build_tools(tools),
+            tool_config: if tools.is_empty() {
+                None
+            } else {
+                Some(GeminiToolConfig {
+                    function_calling_config: GeminiFunctionCallingConfig { mode: "AUTO" },
+                })
+            },
+            session_id: None,
+        };
+        let response = self
+            .post_api_key_json::<VertexGenerateContentResponse>(
+                model,
+                "generateContent",
+                api_key,
+                &request,
+            )
+            .await
+            .context("Gemini API generateContent failed")?;
+        Ok(CodeAssistGenerateResponse {
+            trace_id: None,
+            response: Some(response),
+        })
+    }
+
     async fn generate_content(
         &self,
         state: &GeminiRuntimeState,
@@ -352,6 +531,12 @@ impl GeminiProvider {
         system: &str,
         resume_session_id: Option<&str>,
     ) -> Result<CodeAssistGenerateResponse> {
+        if let Some(api_key) = gemini_auth::load_api_key() {
+            return self
+                .generate_content_with_api_key(&api_key, model, messages, tools, system)
+                .await;
+        }
+
         let request = CodeAssistGenerateRequest {
             model: model.to_string(),
             project: state.project_id.clone(),
@@ -418,7 +603,13 @@ impl Provider for GeminiProvider {
                 }))
                 .await;
 
-            let state = {
+            let api_key = gemini_auth::load_api_key();
+            let state = if api_key.is_some() {
+                GeminiRuntimeState {
+                    project_id: String::new(),
+                    session_id: Uuid::new_v4().to_string(),
+                }
+            } else {
                 let provider = GeminiProvider {
                     client: provider.client.clone(),
                     model: provider.model.clone(),
