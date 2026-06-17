@@ -1,4 +1,6 @@
 use super::*;
+use crate::auth::external::{ExternalAuthSource, trust_external_auth_source};
+use crate::auth::{AuthState, AuthStatus};
 use crate::storage::lock_test_env;
 
 struct GeminiOauthEnvReset {
@@ -174,6 +176,79 @@ fn imports_cli_oauth_tokens_when_native_tokens_missing() {
     } else {
         crate::env::remove_var("JCODE_HOME");
     }
+}
+
+#[test]
+fn load_api_key_prefers_non_empty_env_value() {
+    let _guard = lock_test_env();
+    let prev_key = std::env::var_os(GEMINI_API_KEY_ENV);
+    crate::env::set_var(GEMINI_API_KEY_ENV, " gemini-env-key ");
+
+    assert_eq!(load_api_key().as_deref(), Some(" gemini-env-key "));
+
+    if let Some(prev_key) = prev_key {
+        crate::env::set_var(GEMINI_API_KEY_ENV, prev_key);
+    } else {
+        crate::env::remove_var(GEMINI_API_KEY_ENV);
+    }
+}
+
+#[test]
+fn load_api_key_falls_back_to_trusted_external_key() {
+    let _guard = lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_key = std::env::var_os(GEMINI_API_KEY_ENV);
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::remove_var(GEMINI_API_KEY_ENV);
+
+    let path = ExternalAuthSource::OpenCode.path().expect("opencode path");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create auth dir");
+    std::fs::write(
+        &path,
+        r#"{"gemini":{"type":"api","key":"gemini-external-key"}}"#,
+    )
+    .expect("write auth file");
+    trust_external_auth_source(ExternalAuthSource::OpenCode).expect("trust source");
+
+    assert_eq!(load_api_key().as_deref(), Some("gemini-external-key"));
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    if let Some(prev_key) = prev_key {
+        crate::env::set_var(GEMINI_API_KEY_ENV, prev_key);
+    } else {
+        crate::env::remove_var(GEMINI_API_KEY_ENV);
+    }
+}
+
+#[test]
+fn auth_status_marks_gemini_available_with_api_key_only() {
+    let _guard = lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let prev_home = std::env::var_os("JCODE_HOME");
+    let prev_key = std::env::var_os(GEMINI_API_KEY_ENV);
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::set_var(GEMINI_API_KEY_ENV, "gemini-env-key");
+    AuthStatus::invalidate_cache();
+
+    let status = AuthStatus::check();
+    assert_eq!(status.gemini, AuthState::Available);
+
+    if let Some(prev_home) = prev_home {
+        crate::env::set_var("JCODE_HOME", prev_home);
+    } else {
+        crate::env::remove_var("JCODE_HOME");
+    }
+    if let Some(prev_key) = prev_key {
+        crate::env::set_var(GEMINI_API_KEY_ENV, prev_key);
+    } else {
+        crate::env::remove_var(GEMINI_API_KEY_ENV);
+    }
+    AuthStatus::invalidate_cache();
 }
 
 #[cfg(unix)]

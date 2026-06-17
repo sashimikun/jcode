@@ -752,6 +752,9 @@ fn maybe_enable_claude_auth_for_auto(has_other_provider: bool) -> Result<bool> {
 }
 
 fn ensure_gemini_auth_allowed_for_explicit_choice() -> Result<()> {
+    if auth::gemini::has_api_key() {
+        return Ok(());
+    }
     if auth::gemini::load_tokens().is_ok() {
         return Ok(());
     }
@@ -788,6 +791,9 @@ fn ensure_gemini_auth_allowed_for_explicit_choice() -> Result<()> {
 }
 
 fn maybe_enable_gemini_auth_for_auto(has_other_provider: bool) -> Result<bool> {
+    if auth::gemini::has_api_key() {
+        return Ok(true);
+    }
     if auth::gemini::load_tokens().is_ok() {
         return Ok(true);
     }

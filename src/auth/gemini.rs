@@ -17,6 +17,7 @@ const GEMINI_CLIENT_SECRET: &str = "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"; // git
 // Env vars can override the hardcoded credentials if needed
 const GEMINI_CLIENT_ID_ENV: &str = "GEMINI_CLIENT_ID";
 const GEMINI_CLIENT_SECRET_ENV: &str = "GEMINI_CLIENT_SECRET";
+pub const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 const GEMINI_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -113,7 +114,18 @@ pub fn has_gemini_cli() -> bool {
 
 /// Check if native Gemini OAuth tokens are available (including imported Gemini CLI tokens).
 pub fn has_cached_auth() -> bool {
-    load_tokens().is_ok()
+    has_api_key() || load_tokens().is_ok()
+}
+
+pub fn load_api_key() -> Option<String> {
+    std::env::var(GEMINI_API_KEY_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| crate::auth::external::load_api_key_for_env(GEMINI_API_KEY_ENV))
+}
+
+pub fn has_api_key() -> bool {
+    load_api_key().is_some()
 }
 
 pub fn tokens_path() -> Result<std::path::PathBuf> {

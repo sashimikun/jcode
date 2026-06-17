@@ -568,15 +568,19 @@ impl AuthStatus {
             Err(_) => AuthState::NotConfigured,
         };
 
-        status.gemini = match gemini::load_tokens() {
-            Ok(tokens) => {
-                if tokens.is_expired() {
-                    AuthState::Expired
-                } else {
-                    AuthState::Available
+        status.gemini = if gemini::has_api_key() {
+            AuthState::Available
+        } else {
+            match gemini::load_tokens() {
+                Ok(tokens) => {
+                    if tokens.is_expired() {
+                        AuthState::Expired
+                    } else {
+                        AuthState::Available
+                    }
                 }
+                Err(_) => AuthState::NotConfigured,
             }
-            Err(_) => AuthState::NotConfigured,
         };
 
         let cursor_has_cli = cursor::has_cursor_agent_cli();
@@ -708,15 +712,19 @@ impl AuthStatus {
         timings.push(("antigravity", step_start.elapsed().as_millis()));
 
         let step_start = Instant::now();
-        status.gemini = match gemini::load_tokens() {
-            Ok(tokens) => {
-                if tokens.is_expired() {
-                    AuthState::Expired
-                } else {
-                    AuthState::Available
+        status.gemini = if gemini::has_api_key() {
+            AuthState::Available
+        } else {
+            match gemini::load_tokens() {
+                Ok(tokens) => {
+                    if tokens.is_expired() {
+                        AuthState::Expired
+                    } else {
+                        AuthState::Available
+                    }
                 }
+                Err(_) => AuthState::NotConfigured,
             }
-            Err(_) => AuthState::NotConfigured,
         };
         timings.push(("gemini", step_start.elapsed().as_millis()));
 
@@ -1068,6 +1076,10 @@ fn openai_api_key_source(status: &AuthStatus) -> Option<(AuthCredentialSource, S
 }
 
 fn gemini_source() -> Option<(AuthCredentialSource, String)> {
+    if crate::auth::gemini::has_api_key() {
+        return env_source(crate::auth::gemini::GEMINI_API_KEY_ENV)
+            .or_else(|| external_api_key_source(crate::auth::gemini::GEMINI_API_KEY_ENV));
+    }
     if let Ok(path) = crate::auth::gemini::tokens_path()
         && path.exists()
     {
